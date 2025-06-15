@@ -11,3 +11,5 @@ srcDir        = "src"
 
 requires "nim >= 2.2.2"
 requires "https://github.com/alaviss/nim-sys"
+requires "https://github.com/nim-works/cps"
+

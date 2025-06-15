@@ -10,7 +10,7 @@ proc suspendNext*(t: Task) =
   if t != nil:
     var nextNow = dispatcher.now
     inc nextNow
-    t.rl.waiters.push(Waiter(tag: nextNow, task: t))
+    t.rl.sleepers.push(Sleeper(tag: nextNow, task: t))
 
 proc suspend(t: Task) =
   if t != nil:
@@ -25,8 +25,8 @@ proc sleep*(task: Task, d: Duration): Task {.cpsMagic.} =
   assert task.rl != nil
   debugEcho "Sleeping for " & $d
   withLock task.rl.lock:
-    let w = Waiter(tag: initTimeTag(time = (getMonoTime() + d)), task: task)
-    task.rl.waiters.push(w)
+    let sleeper = Sleeper(tag: initTimeTag(time = (getMonoTime() + d)), task: task)
+    task.rl.sleepers.push(sleeper)
   nil
 
 template deadline*(d: TimeInterval, code: untyped) {.pragma.}

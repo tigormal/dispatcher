@@ -1,11 +1,12 @@
 import threading/once
 import loghelp
-import types, debug, timetag
-import std/[monotimes, times, locks, sets, cpuinfo, options, macros, heapqueue]
+import types, debug, timetag, timer
+import std/[monotimes, times, locks, tables, sets, cpuinfo, options, macros, heapqueue]
 import pkg/[cps]
 
 proc isEmpty*(loop: RunLoop): bool {.inline.} =
-  loop.tasks.len == 0 and loop.waiters.len == 0
+  loop.tasks.len == 0 and loop.waiters.len == 0 and loop.sleepers.len == 0 and
+    loop.timers.len == 0
 
 proc state*(rl: RunLoop): LoopState =
   if rl.halt:
@@ -31,18 +32,47 @@ proc newRunLoop*(mode = DispatchMain): RunLoop =
   result.tasks = @[]
   result.mode = mode
 
+proc addTimer*(timerLoop: var RunLoop, timer: Timer) =
+  ## Add a timer to the run loop
+  assert timerLoop.mode.contains(DispatchTimer)
+  if timerLoop.timers.len > 0:
+    # Signal the existing timer to stop waiting
+    let waitingTimer = timerLoop.timers[0]
+    waitingTimer.signal()
+  timerLoop.timers.add(timer)
+
 proc push*(loop: RunLoop, cont: Continuation, silent = false) {.inline.} =
   if not silent:
     debug loop.repr, " Pushing cont [Thread ", $getThreadId(), "]"
   loop.lock.acquire()
-  loop.tasks.add(cont)
+  loop.tasks.add(Task cont)
   loop.lock.release()
 
 proc push*(loop: RunLoop, task: Task, silent = false) {.inline.} =
   if not silent:
     debug loop.repr, " Pushing task [Thread ", $getThreadId(), "]"
   task.rl = loop
-  loop.push(cont = task, silent = true)
+  # Create a timer if task has a deadline
+  if task.deadline.isSome:
+    debugEcho "Task has deadline: ", $task.deadline
+    if loop.mode.contains(DispatchMain):
+      # Main loop creates Sleepers instead
+      var sleeper = Sleeper()
+      sleeper.task = task
+      sleeper.tag = TimeTag(currentMonoTime() + task.deadline.get, 0)
+      loop.sleepers.add(sleeper)
+      loop.push(cont = task, silent = true)
+      return
+    var deadlineTimer = new Timer
+    deadlineTimer.init(task.deadline.get, oneshot = true)
+    deadlineTimer.task = Task task.onDeadline
+    deadlineTimer.task.rl = loop
+    # FIXME: set the timer ID
+    loop.push(cont = task, silent = true)
+    dispatcher.timerLoop.addTimer(deadlineTimer) # Timer is added already enabled
+  else:
+    # Add the task to the end of the queue
+    loop.push(cont = task, silent = true)
 
 # proc suspend*(c: Continuation, rl: RunLoop) =
 #   if c != nil:
@@ -64,41 +94,58 @@ proc trampoline*[T: Continuation](loop: RunLoop, c: sink T): T {.discardable.} =
     loop.interrupt = false
   result = T c
 
-proc interrupt*(loop: RunLoop, cont: sink Continuation) =
+proc interruptWith*(loop: RunLoop, cont: sink Continuation) =
+  ## Interrupt the run loop with a continuation
   debug loop.repr, "Replacing task [Thread ", $getThreadId(), "]"
   # loop.lock.acquire()
   if cont != nil:
     # FIXME
-    loop.tasks.insert(cont, 0)
-    # loop.interrupt = true
+    loop.tasks.insert(Task cont, 0)
+    loop.interrupt = true
+  # loop.lock.release()
+  #
 
+proc interruptWith*(loop: RunLoop, task: sink Task) =
+  ## Interrupt the run loop with a continuation
+  debug loop.repr, "Replacing task [Thread ", $getThreadId(), "]"
+  # loop.lock.acquire()
+  if task != nil:
+    # FIXME
+    loop.tasks.insert(task, 0)
+    loop.interrupt = true
   # loop.lock.release()
 
-proc processWaiters(loop: RunLoop) =
-  ## Check if any waiters need to be executed
+proc processSleepers(loop: RunLoop) =
+  ## Check if any sleepers need to be executed
   ## Put the in the loop if needed
   withLock loop.lock:
     # debug loop.repr, "Processing waiters: " & $loop.waiters.len
-    if loop.waiters.len == 0:
+    if loop.sleepers.len == 0:
       return
-    let w = loop.waiters[0]
-    # if w.tag.time <= getMonoTime():
-    if w.tag.time <= dispatcher.now:
-      loop.interrupt(w.task) # interrupt or schedule Next
-      loop.waiters.del(0)
+    let sleeper = loop.sleepers[0]
+    # if waiter.tag.time <= getMonoTime():
+    if sleeper.tag.time <= dispatcher.now:
+      loop.interruptWith(sleeper.task) # interrupt or schedule Next
+      loop.sleepers.del(0)
 
 proc processGeneral(loop: RunLoop) =
   ## Just take a task/cont from the queue and trampoline
-  loop.currentTask = loop.tasks.pop
-  loop.trampoline(loop.currentTask)
+  loop.trampoline(loop.tasks.pop)
 
-proc timerJobIteration(timerLoop: RunLoop) {.cps: Continuation.} =
+proc processTimers(timerLoop: RunLoop) =
+  ## Process timers (single iteration)
   assert timerLoop.mode.contains(DispatchTimer)
-  dispatcher.mainLoop.processWaiters()
-  for th in dispatcher.threads:
-    th.rl.processWaiters()
+  # dispatcher.mainLoop.processSleepers()
+  # for th in dispatcher.threads:
+  #   th.rl.processSleepers()
+  var timer = timerLoop.timers[0]
+  # Wait for the timer to fire
+  if timer.check():
+    # Trampoline the continuation
+    timer.task.rl.interruptWith(timer.task)
 
 proc allDone*(disp: Dispatcher): bool =
+  ## Check if all run loops in the dispatcher are done
   result = true
   for th in disp.threads:
     result = result and th.rl.state == Finished
@@ -112,8 +159,8 @@ proc run*(loop: RunLoop) =
     # Do timer stuff if needed
     if loop.mode.contains(DispatchTimer):
       if not dispatcher.allDone:
-        #     loop.push(whelp loop.timerJobIteration(), silent=true)
-        loop.timerJobIteration()
+        #     loop.push(whelp loop.processTimers(), silent=true)
+        loop.processTimers()
 
     # Check if done
     loop.lock.acquire()
@@ -130,10 +177,13 @@ proc run*(loop: RunLoop) =
         info loop.repr, "and finished"
         return
     debug loop.repr, "Trampolining task"
-    loop.currentTask = loop.tasks.pop
+    let currentTask = loop.tasks.pop()
     loop.lock.release()
-    loop.trampoline(loop.currentTask)
+    loop.trampoline(currentTask)
 
+#
+# === RunLoopThread ===
+#
 proc repr*(rlth: RunLoopThread): string =
   result = "RlThread " & $rlth.id
   if rlth.th.running:
@@ -155,10 +205,10 @@ proc newRunLoopThread*(rl: RunLoop): RunLoopThread =
   result.rl = rl
   debug "RlThread", "New for mode: ", dbgDModeName(rl.mode)
 
-proc setId(t: RunLoopThread, id: int) =
-  t.id = id
+proc setId(th: RunLoopThread, id: int) =
+  th.id = id
 
-proc threadFunc*(t: RunLoopThread) {.thread.} =
-  t.setId(getThreadId()) # FIXME: crashes if not in a proc
-  debug t.repr, "Started"
-  t.rl.run()
+proc threadFunc*(th: RunLoopThread) {.thread.} =
+  th.setId(getThreadId()) # FIXME: crashes if not in a proc
+  debug th.repr, "Started"
+  th.rl.run()

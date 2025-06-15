@@ -52,4 +52,5 @@ nimblecache/
 htmldocs/
 *.dSYM
 deps/*
+deps/*/
 !deps/atlas.config

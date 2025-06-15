@@ -7,6 +7,13 @@ import fusion/[matching, astdsl]
 
 var didInitDispatcher = createOnce()
 
+proc now*(d: Dispatcher): TimeTag =
+  ## Returns the current time tag
+  result = d.mainLoop.nextTag
+  for th in d.threads:
+    if th.rl.mode == DispatchMain:
+      result = min(result, th.rl.nextTag)
+
 proc init*(
     T: typedesc[Dispatcher], maxThreads = countProcessors(), timerThread = DispatchMain
 ) =
@@ -52,7 +59,7 @@ proc scheduleNext*(task: Task, mode = DispatchMain, overrideTimeout = none(Durat
   inc nextNow
   case mode
   of DispatchMain:
-    dispatcher.mainLoop.waiters.push(Waiter(tag: nextNow, task: task))
+    dispatcher.mainLoop.sleepers.push(Sleeper(tag: nextNow, task: task))
   of DispatchParallel:
     # Parallel loops are always created on a separate thread
     # if no Parallel loops were created, create a new thread
@@ -64,14 +71,14 @@ proc scheduleNext*(task: Task, mode = DispatchMain, overrideTimeout = none(Durat
     if canCreateThread:
       # TODO: add persistent thread creation (not finish upon all tasks completion)
       var t = newRunLoopThread(newRunLoop(mode = DispatchParallel))
-      t.rl.waiters.push(Waiter(tag: nextNow, task: task))
+      t.rl.sleepers.push(Sleeper(tag: nextNow, task: task))
       createThread(t.th, threadFunc, t)
       dispatcher.threads.add t
     else:
       if mostFreeTh.isSome:
-        mostFreeTh.get.rl.waiters.push(Waiter(tag: nextNow, task: task))
+        mostFreeTh.get.rl.sleepers.push(Sleeper(tag: nextNow, task: task))
       else:
-        dispatcher.mainLoop.waiters.push(Waiter(tag: nextNow, task: task))
+        dispatcher.mainLoop.sleepers.push(Sleeper(tag: nextNow, task: task))
   of DispatchTimer:
     raise newException(ValueError, "DispatchTimer mode is not supported yet")
   else:
@@ -108,15 +115,15 @@ proc scheduleTask*(task: Task, mode = DispatchMain, overrideTimeout = none(Durat
   else:
     raise newException(ValueError, "Unknown mode value")
 
-proc updateTime*() =
-  var result = dispatcher.now
-  for th in dispatcher.threads:
-    result = min(result, th.rl.currentTag)
-      # TODO: check if this is correct. Isn't it max?
-  result = min(result, dispatcher.mainLoop.currentTag)
+# proc updateTime*() =
+#   var result = dispatcher.now
+#   for th in dispatcher.threads:
+#     result = min(result, th.rl.currentTag)
+#       # TODO: check if this is correct. Isn't it max?
+#   result = min(result, dispatcher.mainLoop.currentTag)
 
 proc start*(T: type Dispatcher, mode = DispatchUnset) =
-  when mode.contains(DispatchAsync):
+  if mode.contains(DispatchImmediate):
     dispatcher.immediate = true
     info "Dispatcher", "Starting in async mode"
   else:

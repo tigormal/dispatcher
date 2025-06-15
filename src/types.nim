@@ -1,5 +1,8 @@
-import std/[monotimes, times, locks, options, heapqueue]
+import std/[monotimes, times, locks, options, heapqueue, tables]
 import pkg/[cps]
+import sys/private/ioqueue_bsd {.all.}
+import sys/private/syscall/bsd/kqueue
+import timer
 
 type DispatchMode* = uint8
 
@@ -35,25 +38,28 @@ type
     time*: MonoTime
     step*: Natural
 
-  Waiter* = object
+  Sleeper* = object
     tag*: TimeTag
     task*: Task
 
   RunLoop* = ref object # can run without events (event loop) hence the name
     lock*: Lock
-    tasks*: seq[Continuation]
-      # we use common continuations as tasks' cancel/deadline/completion handlers might be those
-    waiters*: HeapQueue[Waiter]
+    tasks*: seq[Task] # every common Continuation will be turned into Task
+    sleepers*: HeapQueue[Sleeper]
+    waiters*: Table[FD, Waiter]
+    timers*: seq[Timer] # only for the timer loop
     mode*: DispatchMode = DispatchUnset
     until*: MonoTime = high(MonoTime)
     finishWaitTime*: Duration = initDuration(seconds = 1)
     halt*: bool = false
     interrupt*: bool = false
-    currentTask*: Continuation
     nextTag*: TimeTag
+    when defined(bsd):
+      kq*: FD
+      lastId*: int # kqueue event id
 
   Task* = ref object of Continuation
-    suspended*: Task
+    suspended*: Task # TODO: what is this used for?
     deadline*: Option[TimeInterval]
     onCancel*: Continuation
     onDeadline*: Continuation
@@ -69,5 +75,5 @@ func contains*(a, b: DispatchMode): bool {.inline.} =
 func `<`*(a, b: TimeTag): bool =
   a.time < b.time and a.step < b.step
 
-func `<`*(a, b: Waiter): bool =
+func `<`*(a, b: Sleeper): bool =
   a.tag < b.tag
